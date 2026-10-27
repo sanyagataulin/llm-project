@@ -1,7 +1,35 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
+import json
+
+import networkx as nx
+
+from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import Answer, KnowledgeBase
+from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
+
+_LOCAL_SYSTEM = (
+    "Ты ассистент сервисной службы «ПолярТех». Отвечай только по фактам из списка ниже — "
+    "каждая строка это связь графа знаний вида «сущность -ОТНОШЕНИЕ-> сущность». "
+    "Коды деталей, моделей, ошибок и регламентов пиши точно как в фактах. "
+    "Если деталь заменена (REPLACED_BY), называй последнюю деталь цепочки замен. "
+    "Если ответа в фактах нет, напиши: «в базе знаний не найдено»."
+)
+
+_MAP_SYSTEM = (
+    "Ты отвечаешь на вопрос по сводке одной части графа знаний сервисной службы «ПолярТех». "
+    "Верни JSON: поле answer — что из сводки относится к вопросу, "
+    "поле score — целое число от 0 до 10, насколько сводка полезна для ответа. "
+    "Если сводка не помогает ответить, ставь score 0."
+)
+
+_REDUCE_SYSTEM = (
+    "Ты ассистент сервисной службы «ПолярТех». Объедини частичные ответы по разным частям "
+    "базы знаний в один точный ответ на вопрос. Коды и названия пиши точно как в частичных ответах, "
+    "ничего не придумывай. Если ответа нет, напиши: «в базе знаний не найдено»."
+)
+
+_MAX_FACTS_CHARS = 8000
 
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
@@ -14,8 +42,35 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Если в вопросе есть код, которого нет в графе, или фактов нет, возвращается
     `Answer(..., refused=True)` без вызова модели.
     """
-    # TODO: опорные сущности, отбор фактов, запрос к модели, источники
-    raise NotImplementedError("Реализуйте local_search")
+    graph = kb.graph
+    anchors = _anchors(question, kb)
+    if any(_node_id(code_type(code), code) not in graph.nodes for code in find_codes(question)):
+        return _refused()
+    if not anchors:
+        return _refused()
+
+    if len(anchors) >= 2:
+        edges = _path_edges(graph, anchors, cutoff=3)
+    else:
+        edges = _neighbourhood_edges(graph, anchors[0], depth=2)
+    nodes = {edge[0] for edge in edges} | {edge[1] for edge in edges}
+    edges += _replacement_edges(graph, nodes)
+    nodes = {edge[0] for edge in edges} | {edge[1] for edge in edges}
+    edges += _supplier_edges(graph, nodes)
+    edges = _unique_edges(edges)
+    if not edges:
+        return _refused()
+
+    facts = _format_facts(graph, edges)
+    prompt = "Факты:\n" + "\n".join(f"{i}. {fact}" for i, fact in enumerate(facts, start=1))
+    reply = llm.chat(
+        [
+            {"role": "system", "content": _LOCAL_SYSTEM},
+            {"role": "user", "content": f"{prompt}\n\nВопрос: {question}"},
+        ]
+    )
+    sources = sorted({chunk.split("#")[0] for edge in edges for chunk in edge[2]["sources"]})
+    return Answer(reply.content, sources=sources, facts=facts, refused=_is_refusal(reply.content))
 
 
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
@@ -25,5 +80,148 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
     Если таких ответов нет, возвращается `Answer(..., refused=True)`.
     """
-    # TODO: частичные ответы по сводкам, объединение
-    raise NotImplementedError("Реализуйте global_search")
+    partials: list[str] = []
+    sources: set[str] = set()
+    for community in kb.communities:
+        if not community.summary:
+            continue
+        reply = llm.chat(
+            [
+                {"role": "system", "content": _MAP_SYSTEM},
+                {"role": "user", "content": f"Вопрос: {question}\n\nСводка:\n{community.summary}"},
+            ],
+            json_schema=MAP_SCHEMA,
+        )
+        try:
+            data = json.loads(reply.content)
+            answer, score = data["answer"], data["score"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if not isinstance(answer, str) or not isinstance(score, int) or not 0 <= score <= 10:
+            continue
+        if score > 0 and answer.strip():
+            partials.append(answer)
+            for node in community.nodes:
+                sources.update(chunk.split("#")[0] for chunk in kb.graph.nodes[node].get("sources", []))
+    if not partials:
+        return _refused()
+
+    prompt = "\n\n".join(f"Частичный ответ {i}:\n{part}" for i, part in enumerate(partials, start=1))
+    reply = llm.chat(
+        [
+            {"role": "system", "content": _REDUCE_SYSTEM},
+            {"role": "user", "content": f"{prompt}\n\nВопрос: {question}"},
+        ]
+    )
+    return Answer(reply.content, sources=sorted(sources), refused=_is_refusal(reply.content))
+
+
+def _refused() -> Answer:
+    return Answer("В базе знаний не найдено.", refused=True)
+
+
+def _is_refusal(text: str) -> bool:
+    return "не найдено" in text.lower()
+
+
+def _node_id(entity_type: str, name: str) -> str:
+    return f"{entity_type}:{name}"
+
+
+def _anchors(question: str, kb: KnowledgeBase) -> list[str]:
+    found: list[str] = []
+    for code in find_codes(question):
+        node = _node_id(code_type(code), code)
+        if node in kb.graph.nodes and node not in found:
+            found.append(node)
+    for entity_type, name in find_names(question, kb.vocabulary):
+        node = _node_id(entity_type, name)
+        if node in kb.graph.nodes and node not in found:
+            found.append(node)
+    return found
+
+
+def _edge(graph: nx.DiGraph, source: str, target: str) -> list[tuple]:
+    """Направленные рёбра графа между двумя узлами в любом направлении."""
+    return [
+        (u, v, dict(data))
+        for u, v in ((source, target), (target, source))
+        if graph.has_edge(u, v)
+        for data in [graph.edges[u, v]]
+    ]
+
+
+def _path_edges(graph: nx.DiGraph, anchors: list[str], cutoff: int) -> list[tuple]:
+    undirected = graph.to_undirected()
+    edges: list[tuple] = []
+    for i, first in enumerate(anchors):
+        for second in anchors[i + 1 :]:
+            try:
+                paths = nx.all_simple_paths(undirected, first, second, cutoff=cutoff)
+            except nx.NodeNotFound:
+                continue
+            for path in paths:
+                for u, v in zip(path, path[1:], strict=False):
+                    edges.extend(_edge(graph, u, v))
+    return edges
+
+
+def _neighbourhood_edges(graph: nx.DiGraph, anchor: str, depth: int) -> list[tuple]:
+    undirected = graph.to_undirected()
+    ego = nx.ego_graph(undirected, anchor, radius=depth)
+    edges: list[tuple] = []
+    for u, v in ego.edges:
+        edges.extend(_edge(graph, u, v))
+    return edges
+
+
+def _replacement_edges(graph: nx.DiGraph, nodes: set[str]) -> list[tuple]:
+    edges: list[tuple] = []
+    for node in sorted(nodes):
+        current = node
+        seen = {node}
+        while True:
+            next_parts = [
+                t for _, t, e in graph.out_edges(current, data=True) if e["type"] == "REPLACED_BY"
+            ]
+            if not next_parts or next_parts[0] in seen:
+                break
+            target = next_parts[0]
+            edges.extend(_edge(graph, current, target))
+            seen.add(target)
+            current = target
+    return edges
+
+
+def _supplier_edges(graph: nx.DiGraph, nodes: set[str]) -> list[tuple]:
+    edges: list[tuple] = []
+    for node in sorted(nodes):
+        if not node.startswith("Part:"):
+            continue
+        for _, target, edge in graph.out_edges(node, data=True):
+            if edge["type"] == "SUPPLIED_BY":
+                edges.append((node, target, dict(edge)))
+    return edges
+
+
+def _unique_edges(edges: list[tuple]) -> list[tuple]:
+    seen: set[tuple] = set()
+    unique: list[tuple] = []
+    for edge in edges:
+        key = (edge[0], edge[2].get("type"), edge[1])
+        if key not in seen:
+            seen.add(key)
+            unique.append(edge)
+    return unique
+
+
+def _format_facts(graph: nx.DiGraph, edges: list[tuple]) -> list[str]:
+    facts: list[str] = []
+    total = 0
+    for source, target, edge in edges:
+        line = f"{graph.nodes[source]['name']} -{edge['type']}-> {graph.nodes[target]['name']}"
+        if total + len(line) + 1 > _MAX_FACTS_CHARS:
+            break
+        facts.append(line)
+        total += len(line) + 1
+    return facts
