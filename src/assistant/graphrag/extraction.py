@@ -87,7 +87,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     ]
     for attempt in range(2):
         try:
-            reply = llm.chat(messages, json_schema=EXTRACTION_SCHEMA)
+            reply = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=4096)
             raw = _ExtractionOut.model_validate(json.loads(reply.content))
         except (json.JSONDecodeError, ValidationError, TypeError):
             if attempt == 0:
