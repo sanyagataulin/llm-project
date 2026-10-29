@@ -1,11 +1,12 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
 import json
+from collections.abc import Callable
 
 from pydantic import BaseModel, ValidationError
 
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
+from assistant.infra.grounding import CODE_TYPES, canonical_name, code_type, find_codes
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import EXTRACTION_SCHEMA, Chunk, Entity, ExtractionResult, Relation
 
@@ -33,6 +34,9 @@ _SYSTEM = """Ты извлекаешь граф знаний из докумен
 Правила:
 - Извлекай только факты, которые прямо сказаны в тексте чанка.
 - Коды пиши как в тексте; регистр и пробелы не важны.
+- Строка «<узел> – деталь <P-код>, поставщик <поставщик>» в разделе о составе узлов даёт
+  три связи: модель из заголовка -HAS_PART-> деталь, деталь -IS_A-> узел, деталь -SUPPLIED_BY-> поставщик.
+- Соблюдай направление связей из списка выше: IS_A идёт от детали к узлу, HAS_PART от модели к детали.
 - Если подходящих фактов нет, верни пустые списки.
 
 Пример.
@@ -132,8 +136,11 @@ def _filter(chunk: Chunk, raw: _ExtractionOut, vocab: dict[str, list[str]]) -> E
             continue
         relation = Relation(subject, item.type, obj)
         if not relation.matches_schema():
-            dropped += 1
-            continue
+            flipped = Relation(obj, item.type, subject)
+            if not flipped.matches_schema():
+                dropped += 1
+                continue
+            relation, subject, obj = flipped, obj, subject
         key = (subject.node_id, relation.type, obj.node_id)
         if key in seen:
             continue
@@ -142,4 +149,37 @@ def _filter(chunk: Chunk, raw: _ExtractionOut, vocab: dict[str, list[str]]) -> E
         entities.setdefault(obj.node_id, obj)
         relations.append(relation)
 
+    _add_manual_parts(chunk, canon, entities, relations, seen)
+
     return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(entities.values()), relations, dropped)
+
+
+def _add_manual_parts(
+    chunk: Chunk,
+    canon: Callable[[str, str], Entity | None],
+    entities: dict[str, Entity],
+    relations: list[Relation],
+    seen: set[tuple[str, str, str]],
+) -> None:
+    """В руководстве manual_<Model>.md деталь со связью IS_A установлена в эту модель.
+
+    Модель нередко не выписывает HAS_PART, хотя строка «<узел> – деталь <P-код>» означает
+    именно установку детали в модель из заголовка. Связь достраивается детерминированно.
+    """
+    model: Entity | None = None
+    for code in find_codes(chunk.doc_id):
+        if code_type(code) == "Model":
+            model = canon("Model", code)
+            break
+    if model is None:
+        return
+    for relation in list(relations):
+        if relation.type != "IS_A":
+            continue
+        part = relation.subject
+        key = (model.node_id, "HAS_PART", part.node_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.setdefault(model.node_id, model)
+        relations.append(Relation(model, "HAS_PART", part))

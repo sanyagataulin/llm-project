@@ -14,15 +14,25 @@ _SYSTEM = (
     "Ты — ассистент сервисной службы «ПолярТех». Отвечай диспетчеру, используя инструменты.\n"
     "Правила:\n"
     "- Сначала ищи в базе знаний: search_knowledge для конкретных вопросов, summarize_topic для обзорных.\n"
+    "- Если в вопросе есть код (E-17, P-1042, AR-210, SP-104) или название узла — "
+    "первым делом вызови search_knowledge, всегда.\n"
+    "- Если summarize_topic ответил «не найдено», вызови search_knowledge с тем же вопросом.\n"
     "- Остатки и цены известны только в ERP: check_stock и get_price. Никогда не называй их по памяти.\n"
     "- Номер детали бери только из вопроса или результатов инструментов.\n"
     "- Заказ create_service_order вызывай, только когда деталь, склад и количество точно известны.\n"
-    "- Если данных нет, честно отвечай: «в базе знаний не найдено»."
+    "- Не пиши «в базе знаний не найдено», пока не вызван подходящий инструмент.\n"
+    "- Если ответа на вопрос нет в результатах инструментов — честно откажись и заверши ответ "
+    "последней строкой «Ответ: в базе знаний не найдено». Если сущность нашлась, а для заказа "
+    "не хватает количества или склада, назови найденное и уточни параметры — это не отказ."
 )
 
 _LIMIT_NOTE = (
     "Лимит вызовов инструментов исчерпан. Сформулируй ответ по уже полученным результатам "
     "и скажи, что работа прервана."
+)
+_NO_SEARCH_NOTE = (
+    "Ты ответил отказом, но в вопросе есть код сущности, а search_knowledge не вызывался. "
+    "Вызови search_knowledge с вопросом пользователя и только потом отвечай."
 )
 _CORRECTION = (
     "В твоём ответе есть факты, которых нет ни в вопросе, ни в результатах инструментов: {facts}. "
@@ -62,6 +72,7 @@ def run_agent(
     response = None
     budget = max_steps
     pending: dict | None = None
+    nudged = False
     while response is None or response.tool_calls:
         if response is not None:
             for call in response.tool_calls:
@@ -97,6 +108,18 @@ def run_agent(
                 break
         response = llm.chat(messages, tools=TOOL_SCHEMAS)
         messages.append(response.as_message())
+        # Отказ без единого поиска по коду из вопроса — подталкиваем модель к search_knowledge.
+        if (
+            not response.tool_calls
+            and not nudged
+            and budget > 0
+            and _is_refusal(response.content)
+            and find_codes(question)
+            and not any(step.tool == "search_knowledge" for step in steps)
+        ):
+            nudged = True
+            messages.append({"role": "user", "content": _NO_SEARCH_NOTE})
+            response = None
 
     answer = response.content or "Работа прервана: исчерпан лимит вызовов инструментов."
     for _ in range(1):
@@ -191,4 +214,11 @@ def _pending_text(pending: dict) -> str:
 
 
 def _is_refusal(text: str) -> bool:
-    return "не найдено" in text.lower()
+    """Отказ — когда фразой «не найдено» является итоговый ответ, а не слова в середине текста."""
+    lines = [line.strip() for line in text.lower().splitlines() if line.strip()]
+    if not lines:
+        return True
+    for line in reversed(lines):
+        if line.startswith("ответ"):
+            return "не найдено" in line
+    return "не найдено" in lines[-1]

@@ -13,23 +13,36 @@ _LOCAL_SYSTEM = (
     "каждая строка это связь графа знаний вида «сущность -ОТНОШЕНИЕ-> сущность». "
     "Коды деталей, моделей, ошибок и регламентов пиши точно как в фактах. "
     "Если деталь заменена (REPLACED_BY), называй последнюю деталь цепочки замен. "
-    "Если ответа в фактах нет, напиши: «в базе знаний не найдено»."
+    "Последней строкой напиши «Ответ: …» — только суть, одной фразой, например «Ответ: SP-104». "
+    "Отказывайся, только если в фактах действительно нет ответа: "
+    "тогда единственная строка «в базе знаний не найдено»."
 )
 
 _MAP_SYSTEM = (
     "Ты отвечаешь на вопрос по сводке одной части графа знаний сервисной службы «ПолярТех». "
     "Верни JSON: поле answer — что из сводки относится к вопросу, "
     "поле score — целое число от 0 до 10, насколько сводка полезна для ответа. "
-    "Если сводка не помогает ответить, ставь score 0."
+    "Ставь score 0, если сводка не помогает ответить или она про другие сущности и линейки, "
+    "чем в вопросе."
 )
 
 _REDUCE_SYSTEM = (
     "Ты ассистент сервисной службы «ПолярТех». Объедини частичные ответы по разным частям "
-    "базы знаний в один точный ответ на вопрос. Коды и названия пиши точно как в частичных ответах, "
-    "ничего не придумывай. Если ответа нет, напиши: «в базе знаний не найдено»."
+    "базы знаний в один точный ответ на вопрос. Перед каждым частичным ответом в скобках "
+    "перечислены сущности его части графа — используй только те части, чьи сущности относятся "
+    "к вопросу (например, к линейке из вопроса), остальные игнорируй. "
+    "Коды и названия пиши точно как в частичных ответах, ничего не придумывай. "
+    "Последней строкой напиши «Ответ: …» — только суть, одной фразой. "
+    "Если ответа нет, напиши единственную строку: «в базе знаний не найдено»."
 )
 
 _MAX_FACTS_CHARS = 8000
+
+_RECHECK = (
+    "Проверь список фактов ещё раз: если в нём есть связи, отвечающие на вопрос, "
+    "дай последней строкой «Ответ: …». Если ответа действительно нет, повтори "
+    "«в базе знаний не найдено»."
+)
 
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
@@ -63,12 +76,16 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
 
     facts = _format_facts(graph, edges)
     prompt = "Факты:\n" + "\n".join(f"{i}. {fact}" for i, fact in enumerate(facts, start=1))
-    reply = llm.chat(
-        [
-            {"role": "system", "content": _LOCAL_SYSTEM},
-            {"role": "user", "content": f"{prompt}\n\nВопрос: {question}"},
-        ]
-    )
+    messages = [
+        {"role": "system", "content": _LOCAL_SYSTEM},
+        {"role": "user", "content": f"{prompt}\n\nВопрос: {question}"},
+    ]
+    reply = llm.chat(messages)
+    if _is_refusal(reply.content):
+        # Факты были, но модель отказалась — просим перепроверить список.
+        reply = llm.chat(
+            [*messages, reply.as_message(), {"role": "user", "content": _RECHECK}]
+        )
     sources = sorted({chunk.split("#")[0] for edge in edges for chunk in edge[2]["sources"]})
     return Answer(reply.content, sources=sources, facts=facts, refused=_is_refusal(reply.content))
 
@@ -85,10 +102,17 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     for community in kb.communities:
         if not community.summary:
             continue
+        members = ", ".join(sorted(kb.graph.nodes[node]["name"] for node in community.nodes))
         reply = llm.chat(
             [
                 {"role": "system", "content": _MAP_SYSTEM},
-                {"role": "user", "content": f"Вопрос: {question}\n\nСводка:\n{community.summary}"},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Вопрос: {question}\n\nСущности сообщества: {members}\n\n"
+                        f"Сводка:\n{community.summary}"
+                    ),
+                },
             ],
             json_schema=MAP_SCHEMA,
         )
@@ -100,7 +124,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         if not isinstance(answer, str) or not isinstance(score, int) or not 0 <= score <= 10:
             continue
         if score > 0 and answer.strip():
-            partials.append(answer)
+            partials.append(f"Сущности части: {members}\n{answer.strip()}")
             for node in community.nodes:
                 sources.update(chunk.split("#")[0] for chunk in kb.graph.nodes[node].get("sources", []))
     if not partials:
@@ -121,7 +145,17 @@ def _refused() -> Answer:
 
 
 def _is_refusal(text: str) -> bool:
-    return "не найдено" in text.lower()
+    """Отказ — когда фразой «не найдено» является итоговый ответ, а не слова в середине текста.
+
+    Смотрим на последнюю строку «Ответ: …»; если её нет — на последнюю непустую строку.
+    """
+    lines = [line.strip() for line in text.lower().splitlines() if line.strip()]
+    if not lines:
+        return True
+    for line in reversed(lines):
+        if line.startswith("ответ"):
+            return "не найдено" in line
+    return "не найдено" in lines[-1]
 
 
 def _node_id(entity_type: str, name: str) -> str:
